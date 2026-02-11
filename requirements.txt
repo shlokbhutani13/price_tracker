@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+jinja2
+aiosqlite
+httpx
+beautifulsoup4
+lxml
