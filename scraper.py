@@ -1,136 +1,323 @@
-import re
+import ipaddress
 import json
-from urllib.parse import urlparse
+import re
+import socket
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup
 
+MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+MAX_REDIRECTS = 4
+USER_AGENT = "PriceTracker/1.0 (+https://github.com/shlokbhutani13/price_tracker)"
+
+
 class ScrapeBlocked(Exception):
     pass
+
 
 class ScrapeFailed(Exception):
     pass
 
 
-def _clean_text(s: str | None) -> str:
-    return re.sub(r"\s+", " ", (s or "")).strip()
+@dataclass(frozen=True)
+class ProductResult:
+    url: str
+    title: str
+    price: float
+    currency: str
+    in_stock: bool | None
 
 
-def _parse_money(s: str | None) -> tuple[float | None, str | None]:
-    if not s:
+def clean_text(value: str | None) -> str:
+    return re.sub(r"\s+", " ", value or "").strip()
+
+
+def parse_money(value: str | None) -> tuple[float | None, str | None]:
+    if not value:
         return None, None
-    s = _clean_text(s)
-    m = re.search(r"(US\s*\$|\$|£|€)\s*([0-9][0-9,]*\.?[0-9]*)", s)
-    if not m:
+
+    match = re.search(
+        r"(US\s*\$|USD|GBP|EUR|\$|£|€)\s*([0-9][0-9,]*(?:\.[0-9]+)?)",
+        clean_text(value),
+        flags=re.IGNORECASE,
+    )
+    if not match:
         return None, None
-    cur = m.group(1).replace(" ", "")
-    num = m.group(2).replace(",", "")
+
+    currency = match.group(1).replace(" ", "")
+    if currency.upper() == "US$":
+        currency = "$"
+
     try:
-        return float(num), cur
-    except:
-        return None, cur
+        return float(match.group(2).replace(",", "")), currency
+    except ValueError:
+        return None, currency
 
 
-async def _fetch_html(url: str) -> str:
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        )
-    }
-    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=20) as client:
-        r = await client.get(url)
-        text = r.text
-
-        lowered = text.lower()
-        if r.status_code in (401, 403, 429):
-            raise ScrapeBlocked(f"Blocked by site (HTTP {r.status_code}).")
-        if "captcha" in lowered or "verify you are human" in lowered or "robot check" in lowered:
-            raise ScrapeBlocked("Blocked by site (captcha/robot check).")
-
-        if r.status_code >= 400:
-            raise ScrapeFailed(f"Failed to fetch page (HTTP {r.status_code}).")
-
-        return text
+def _is_public_ip(value: str) -> bool:
+    try:
+        return ipaddress.ip_address(value).is_global
+    except ValueError:
+        return False
 
 
-def _generic_title(soup: BeautifulSoup) -> str:
-    og = soup.find("meta", property="og:title")
-    if og and og.get("content"):
-        return _clean_text(og["content"])
-    if soup.title and soup.title.text:
-        return _clean_text(soup.title.text)
-    h1 = soup.find("h1")
-    if h1 and h1.get_text():
-        return _clean_text(h1.get_text())
+def validate_public_url(url: str) -> str:
+    value = clean_text(url)
+    parsed = urlparse(value)
+
+    if parsed.scheme not in {"http", "https"}:
+        raise ScrapeFailed("Enter a valid HTTP or HTTPS product URL.")
+    if not parsed.hostname:
+        raise ScrapeFailed("The URL must include a host.")
+    if parsed.username or parsed.password:
+        raise ScrapeFailed("URLs containing credentials are not supported.")
+
+    hostname = parsed.hostname.rstrip(".").lower()
+    if hostname == "localhost" or hostname.endswith((".localhost", ".local")):
+        raise ScrapeFailed("The URL must point to a public website.")
+
+    try:
+        literal = ipaddress.ip_address(hostname)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        if not literal.is_global:
+            raise ScrapeFailed("The URL must point to a public website.")
+        return value
+
+    try:
+        addresses = {
+            result[4][0]
+            for result in socket.getaddrinfo(
+                hostname,
+                parsed.port or (443 if parsed.scheme == "https" else 80),
+                type=socket.SOCK_STREAM,
+            )
+        }
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ScrapeFailed("The website address could not be resolved.") from exc
+
+    if not addresses or any(not _is_public_ip(address) for address in addresses):
+        raise ScrapeFailed("The URL must point to a public website.")
+
+    return value
+
+
+async def _read_bounded_html(response: httpx.Response) -> str:
+    content_type = response.headers.get("content-type", "").lower()
+    if "text/html" not in content_type and "application/xhtml+xml" not in content_type:
+        raise ScrapeFailed("The URL did not return an HTML page.")
+
+    declared_size = response.headers.get("content-length")
+    if declared_size:
+        try:
+            if int(declared_size) > MAX_RESPONSE_BYTES:
+                raise ScrapeFailed("The page is too large to inspect safely.")
+        except ValueError:
+            pass
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        body.extend(chunk)
+        if len(body) > MAX_RESPONSE_BYTES:
+            raise ScrapeFailed("The page is too large to inspect safely.")
+
+    encoding = response.encoding or "utf-8"
+    return bytes(body).decode(encoding, errors="replace")
+
+
+async def fetch_html(
+    url: str,
+    client: httpx.AsyncClient | None = None,
+) -> tuple[str, str]:
+    current_url = validate_public_url(url)
+    owns_client = client is None
+    active_client = client or httpx.AsyncClient(timeout=20, follow_redirects=False)
+
+    try:
+        for _ in range(MAX_REDIRECTS + 1):
+            try:
+                async with active_client.stream(
+                    "GET",
+                    current_url,
+                    headers={"User-Agent": USER_AGENT, "Accept": "text/html"},
+                    follow_redirects=False,
+                ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ScrapeFailed("The website returned an invalid redirect.")
+                        current_url = validate_public_url(urljoin(current_url, location))
+                        continue
+
+                    if response.status_code in {401, 403, 429}:
+                        raise ScrapeBlocked(
+                            f"The website refused automated access (HTTP {response.status_code})."
+                        )
+                    if response.status_code >= 400:
+                        raise ScrapeFailed(
+                            f"The website returned HTTP {response.status_code}."
+                        )
+
+                    html = await _read_bounded_html(response)
+            except ScrapeBlocked:
+                raise
+            except ScrapeFailed:
+                raise
+            except httpx.HTTPError as exc:
+                raise ScrapeFailed("The website could not be reached.") from exc
+
+            lowered = html.lower()
+            if any(
+                marker in lowered
+                for marker in ("captcha", "verify you are human", "robot check")
+            ):
+                raise ScrapeBlocked("The website returned a bot-verification page.")
+
+            return html, current_url
+
+        raise ScrapeFailed("The website redirected too many times.")
+    finally:
+        if owns_client:
+            await active_client.aclose()
+
+
+def _walk_json(value: Any):
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _walk_json(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_json(child)
+
+
+def _availability(value: Any) -> bool | None:
+    text = clean_text(str(value)).lower()
+    if not text:
+        return None
+    if text.endswith("instock") or text.endswith("limitedavailability"):
+        return True
+    if text.endswith(("outofstock", "soldout", "discontinued")):
+        return False
+    return None
+
+
+def _structured_product(
+    soup: BeautifulSoup,
+) -> tuple[str | None, float | None, str | None, bool | None]:
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "")
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        for item in _walk_json(data):
+            offers = item.get("offers")
+            if not offers:
+                continue
+
+            offer_list = offers if isinstance(offers, list) else [offers]
+            for offer in offer_list:
+                if not isinstance(offer, dict):
+                    continue
+                raw_price = offer.get("price", offer.get("lowPrice"))
+                if raw_price is None:
+                    continue
+                try:
+                    price = float(str(raw_price).replace(",", "").strip())
+                except ValueError:
+                    continue
+
+                title = clean_text(item.get("name")) or None
+                currency = clean_text(offer.get("priceCurrency")) or None
+                return title, price, currency, _availability(offer.get("availability"))
+
+    return None, None, None, None
+
+
+def _page_title(soup: BeautifulSoup) -> str:
+    open_graph = soup.find("meta", property="og:title")
+    if open_graph and open_graph.get("content"):
+        return clean_text(open_graph["content"])
+    heading = soup.find("h1")
+    if heading:
+        return clean_text(heading.get_text())
+    if soup.title:
+        return clean_text(soup.title.get_text())
     return "Product"
 
 
-def _generic_price(soup: BeautifulSoup) -> tuple[float | None, str | None]:
-    # Try OpenGraph product price tags if present
-    for prop in ["product:price:amount", "og:price:amount"]:
-        m = soup.find("meta", property=prop)
-        if m and m.get("content"):
-            try:
-                price = float(str(m["content"]).replace(",", "").strip())
-                curm = soup.find("meta", property="product:price:currency") or soup.find("meta", property="og:price:currency")
-                cur = curm.get("content") if curm and curm.get("content") else None
-                return price, cur
-            except:
-                pass
-
-    # Try JSON-LD offers
-    for s in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(s.string or "")
-        except:
+def _meta_price(soup: BeautifulSoup) -> tuple[float | None, str | None]:
+    for attribute, value in (
+        ("property", "product:price:amount"),
+        ("property", "og:price:amount"),
+        ("itemprop", "price"),
+    ):
+        tag = soup.find("meta", attrs={attribute: value})
+        if not tag or not tag.get("content"):
             continue
-        candidates = data if isinstance(data, list) else [data]
-        for obj in candidates:
-            if not isinstance(obj, dict):
-                continue
-            offers = obj.get("offers")
-            if isinstance(offers, list) and offers:
-                offers = offers[0]
-            if isinstance(offers, dict):
-                p = offers.get("price")
-                cur = offers.get("priceCurrency")
-                if p is not None:
-                    try:
-                        return float(str(p).replace(",", "").strip()), cur
-                    except:
-                        return None, cur
+        try:
+            price = float(str(tag["content"]).replace(",", "").strip())
+        except ValueError:
+            continue
 
-    # Fallback: scan visible text for a money pattern (best-effort)
-    text = soup.get_text(" ", strip=True)
-    return _parse_money(text)
+        currency_tag = (
+            soup.find("meta", property="product:price:currency")
+            or soup.find("meta", property="og:price:currency")
+            or soup.find("meta", itemprop="priceCurrency")
+        )
+        currency = (
+            clean_text(currency_tag.get("content"))
+            if currency_tag and currency_tag.get("content")
+            else None
+        )
+        return price, currency
+    return None, None
 
 
-async def scrape_product(url: str) -> dict:
-    if not url.startswith("http"):
-        raise ScrapeFailed("URL must start with http/https")
-
-    host = (urlparse(url).netloc or "").lower()
-    html = await _fetch_html(url)
+async def scrape_product(
+    url: str,
+    client: httpx.AsyncClient | None = None,
+) -> ProductResult:
+    html, final_url = await fetch_html(url, client=client)
     soup = BeautifulSoup(html, "lxml")
+    hostname = (urlparse(final_url).hostname or "").lower()
 
-    # ✅ Guaranteed demo site: books.toscrape.com
-    if "books.toscrape.com" in host:
-        title_el = soup.select_one("div.product_main h1")
-        price_el = soup.select_one("p.price_color")
-        title = _clean_text(title_el.get_text()) if title_el else "Book"
-        price_txt = _clean_text(price_el.get_text()) if price_el else None
-        price, currency = _parse_money(price_txt)
+    if hostname == "books.toscrape.com":
+        title_element = soup.select_one("div.product_main h1")
+        price_element = soup.select_one("p.price_color")
+        stock_element = soup.select_one("p.instock.availability")
+        title = clean_text(title_element.get_text()) if title_element else "Book"
+        price, currency = parse_money(
+            price_element.get_text() if price_element else None
+        )
         if price is None:
-            raise ScrapeFailed("Could not read price from the page.")
-        return {"url": url, "title": title, "price": price, "currency": currency or "£", "in_stock": True}
+            raise ScrapeFailed("The page did not contain a readable book price.")
+        return ProductResult(
+            url=final_url,
+            title=title,
+            price=price,
+            currency=currency or "£",
+            in_stock=bool(stock_element),
+        )
 
-    # ✅ Best-effort for other pages (may be blocked)
-    title = _generic_title(soup)
-    price, currency = _generic_price(soup)
-
+    title, price, currency, in_stock = _structured_product(soup)
     if price is None:
-        raise ScrapeFailed("Unsupported page or price not detectable (some stores block scrapers).")
+        price, currency = _meta_price(soup)
+    if price is None:
+        price, currency = parse_money(soup.get_text(" ", strip=True))
+    if price is None:
+        raise ScrapeFailed("No reliable product price was found on this page.")
 
-    return {"url": url, "title": title, "price": price, "currency": currency or "$", "in_stock": True}
+    return ProductResult(
+        url=final_url,
+        title=title or _page_title(soup),
+        price=price,
+        currency=currency or "$",
+        in_stock=in_stock,
+    )

@@ -1,104 +1,178 @@
 <!doctype html>
-<html>
+<html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
     <title>Price Tracker</title>
-    <style>
-      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial; max-width: 980px; margin: 24px auto; padding: 0 14px; }
-      h1 { margin-bottom: 8px; }
-      .muted { color:#6b7280; font-size: 13px; line-height: 1.35; }
-      .card { border: 1px solid #e5e7eb; border-radius: 14px; padding: 14px; margin: 12px 0; background: #fff; }
-      .row { display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start; }
-      .btn { padding: 10px 12px; border-radius: 12px; border: 1px solid #d1d5db; background: #fff; cursor: pointer; }
-      .btn.danger { border-color:#fecaca; background:#fff5f5; }
-      input { width: 100%; padding: 12px; border-radius: 12px; border: 1px solid #d1d5db; }
-      .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; border:1px solid #e5e7eb; font-size:12px; }
-      .ok { border-color:#bbf7d0; background:#f0fdf4; }
-      .bad { border-color:#fecaca; background:#fff5f5; }
-      .warn { border-color:#fde68a; background:#fffbeb; }
-      .url { word-break: break-all; font-size: 12px; color:#6b7280; margin-top:4px; }
-      .grid { display:grid; gap: 6px; margin-top:10px; }
-    </style>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}" />
   </head>
   <body>
-    <div class="muted" style="margin-bottom:10px">
-      Note: Some stores block automated checking. If blocked, you’ll see a clear error instead of fake prices.
-    </div>
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="site-header">
+      <a class="brand" href="/" aria-label="Price Tracker home">
+        <span class="brand-mark">PT</span>
+        <span>Price Tracker</span>
+      </a>
+      <span class="header-note">FastAPI · SQLite · structured metadata</span>
+    </header>
 
-    <h1>Price Tracker (Web Scraper Demo)</h1>
-    <p class="muted">Paste a product link (demo works with books.toscrape.com). This demo is guaranteed to work with books.toscrape.com. Some real stores block automated checking, so you may see a blocked/unsupported message.</p>
+    <main class="page-shell" id="main-content">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Product price snapshots</p>
+          <h1>Track a product without pretending every store is scrapeable.</h1>
+          <p class="lede">
+            Add a public product page, save its current price, and compare later
+            checks. Structured product metadata is preferred; unsupported or
+            blocked pages return a clear error.
+          </p>
+        </div>
 
-    <div class="card">
-      <form method="post" action="/add">
-        <label class="muted">Product URL</label><br/>
-        <input name="url" placeholder="https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html" required />
-        <div style="height:10px"></div>
-        <button class="btn" type="submit">Add Watch</button>
-      </form>
-    </div>
+        <form class="tracker-form" id="tracker-form" method="post" action="/add">
+          <label for="product-url">Product URL</label>
+          <div class="input-row">
+            <input
+              id="product-url"
+              name="url"
+              type="url"
+              placeholder="https://books.toscrape.com/catalogue/..."
+              autocomplete="url"
+              required
+            />
+            <button class="button button-primary" type="submit">Add watch</button>
+          </div>
+          <div class="form-help">
+            <span>Reliable sample: books.toscrape.com</span>
+            <button class="text-button" id="sample-button" type="button">
+              Use sample URL
+            </button>
+          </div>
+        </form>
+      </section>
 
-    {% for item in rows %}
-      {% set r = item[0] %}
-      {% set stats = item[1] %}
-      {% set wid = r[0] %}
-      {% set url = r[1] %}
-      {% set title = r[2] %}
-      {% set last_price = r[3] %}
-      {% set currency = r[4] %}
-      {% set in_stock = r[5] %}
-      {% set last_checked = r[6] %}
-      {% set last_error = r[7] %}
+      {% if notice %}
+        <div class="notice notice-{{ notice_kind }}" role="status">
+          {{ notice }}
+        </div>
+      {% endif %}
 
-      {% set hist_count = stats[0] %}
-      {% set min_price = stats[1] %}
-      {% set lp = stats[2] %}
-      {% set prev = stats[3] %}
-      {% set trend = stats[4] %}
+      <section class="watch-section" aria-labelledby="watch-heading">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">Saved watches</p>
+            <h2 id="watch-heading">Price history</h2>
+          </div>
+          <span class="watch-count">{{ tracked | length }} tracked</span>
+        </div>
 
-      <div class="card">
-        <div class="row">
-          <div style="flex:1; min-width: 260px;">
-            <div><strong>{{ title }}</strong></div>
-            <div class="url">{{ url }}</div>
+        {% if not tracked %}
+          <div class="empty-state">
+            <h3>No products tracked yet</h3>
+            <p>
+              Try the sample book URL to see a successful scrape and stored
+              price snapshot.
+            </p>
+          </div>
+        {% endif %}
 
-            <div class="grid">
-              {% if last_error %}
-                <div class="pill bad">Blocked / Error</div>
-                <div class="muted">{{ last_error }}</div>
-              {% else %}
-                {% if last_price is not none %}
-                  <div class="pill ok">Current: {{ currency }}{{ "%.2f"|format(last_price) }}</div>
-                {% else %}
-                  <div class="pill warn">No price detected</div>
+        <div class="watch-list">
+          {% for item in tracked %}
+            {% set watch = item.watch %}
+            {% set stats = item.stats %}
+            <article class="watch-card">
+              <div class="watch-main">
+                <div class="watch-title-row">
+                  <div>
+                    <h3>{{ watch.title }}</h3>
+                    <a href="{{ watch.url }}" target="_blank" rel="noreferrer">
+                      {{ watch.url }}
+                    </a>
+                  </div>
+                  <div class="current-price">{{ item.price_text }}</div>
+                </div>
+
+                <div class="status-row">
+                  {% if watch.last_error %}
+                    <span class="status status-error">Check failed</span>
+                  {% elif watch.in_stock is sameas true %}
+                    <span class="status status-success">In stock</span>
+                  {% elif watch.in_stock is sameas false %}
+                    <span class="status status-muted">Out of stock</span>
+                  {% else %}
+                    <span class="status status-muted">Availability unknown</span>
+                  {% endif %}
+                  <span class="checked">Checked {{ watch.last_checked }}</span>
+                </div>
+
+                {% if watch.last_error %}
+                  <p class="error-copy">{{ watch.last_error }}</p>
                 {% endif %}
-              {% endif %}
 
-              <div>
-                {% if in_stock == 1 %}
-                  <span class="pill ok">In stock</span>
-                {% else %}
-                  <span class="pill bad">Out of stock</span>
+                <div class="history-grid">
+                  <div>
+                    <span>Lowest seen</span>
+                    <strong>{{ item.lowest_text }}</strong>
+                  </div>
+                  <div>
+                    <span>Snapshots</span>
+                    <strong>{{ stats.count }}</strong>
+                  </div>
+                  <div>
+                    <span>Latest trend</span>
+                    <strong>{{ item.trend_text }}</strong>
+                  </div>
+                </div>
+
+                {% if item.bars %}
+                  <div class="mini-chart" aria-label="Recent price history">
+                    {% for bar in item.bars %}
+                      <span
+                        class="chart-bar"
+                        style="height: {{ '%.1f' | format(bar.height) }}%"
+                        title="{{ watch.currency or '' }} {{ '%.2f' | format(bar.price) }} · {{ bar.checked_at }}"
+                      ></span>
+                    {% endfor %}
+                  </div>
                 {% endif %}
               </div>
 
-              <div class="muted">Snapshots stored: {{ hist_count }}</div>
-              <div class="muted">Lowest seen: {% if min_price is not none %}{{ currency }}{{ "%.2f"|format(min_price) }}{% else %}—{% endif %}</div>
-              <div class="muted">Trend: {{ trend }}</div>
-              <div class="muted">Last checked: {{ last_checked }}</div>
-            </div>
-          </div>
-
-          <div style="display:flex; gap:10px; flex-wrap:wrap;">
-            <form method="post" action="/refresh/{{ wid }}">
-              <button class="btn" type="submit">Refresh</button>
-            </form>
-            <form method="post" action="/delete/{{ wid }}" onsubmit="return confirm('Remove this watch?')">
-              <button class="btn danger" type="submit">Remove</button>
-            </form>
-          </div>
+              <div class="watch-actions">
+                <form method="post" action="/refresh/{{ watch.id }}">
+                  <button class="button" type="submit">Refresh</button>
+                </form>
+                <form
+                  method="post"
+                  action="/delete/{{ watch.id }}"
+                  onsubmit="return confirm('Remove this watch?')"
+                >
+                  <button class="button button-danger" type="submit">Remove</button>
+                </form>
+              </div>
+            </article>
+          {% endfor %}
         </div>
-      </div>
-    {% endfor %}
+      </section>
+    </main>
+
+    <footer>
+      This project checks public pages only and does not attempt to bypass store
+      protections.
+    </footer>
+
+    <script>
+      const sampleUrl =
+        "https://books.toscrape.com/catalogue/a-light-in-the-attic_1000/index.html";
+      document.getElementById("sample-button").addEventListener("click", () => {
+        const input = document.getElementById("product-url");
+        input.value = sampleUrl;
+        input.focus();
+      });
+      document.getElementById("tracker-form").addEventListener("submit", (event) => {
+        const button = event.currentTarget.querySelector('button[type="submit"]');
+        button.disabled = true;
+        button.textContent = "Checking…";
+      });
+    </script>
   </body>
 </html>
