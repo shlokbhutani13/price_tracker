@@ -2,7 +2,10 @@
 
 Price Tracker is a small FastAPI application for saving product-price snapshots from public web pages. It demonstrates the parts of scraping that matter in a backend project: URL validation, bounded HTTP requests, structured metadata parsing, controlled failures, SQLite history, and a server-rendered interface.
 
-[View the live application](https://price-tracker-3sjc.onrender.com)
+## See it in action
+
+- [Open the live application](https://price-tracker-3sjc.onrender.com)
+- [Project overview in my portfolio](https://shlokbhutani13.github.io/)
 
 ## What it does
 
