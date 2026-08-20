@@ -110,3 +110,41 @@ def test_delete_removes_watch(monkeypatch, client):
 
     assert redirect_notice(response)["kind"] == ["success"]
     assert "No products tracked yet" in client.get("/").text
+
+
+def test_api_add_refresh_history_and_delete_watch(monkeypatch, client):
+    async def first_scrape(url):
+        return ProductResult(url, "Desk Lamp", 34.9, "USD", True)
+
+    monkeypatch.setattr(app_module, "scrape_product", first_scrape)
+    created = client.post(
+        "/api/watches",
+        json={"url": "https://example.com/lamp?utm_source=test"},
+    )
+
+    assert created.status_code == 201
+    watch_id = created.json()["watch"]["id"]
+    assert created.json()["watch"]["url"] == "https://example.com/lamp"
+
+    async def refreshed_scrape(url):
+        return ProductResult(url, "Desk Lamp", 29.9, "USD", True)
+
+    monkeypatch.setattr(app_module, "scrape_product", refreshed_scrape)
+    refreshed = client.post(f"/api/watches/{watch_id}/refresh")
+    assert refreshed.status_code == 200
+    assert refreshed.json()["watch"]["last_price"] == 29.9
+
+    history = client.get(f"/api/watches/{watch_id}/history")
+    assert history.status_code == 200
+    assert [point["price"] for point in history.json()["history"]] == [34.9, 29.9]
+
+    deleted = client.delete(f"/api/watches/{watch_id}")
+    assert deleted.status_code == 204
+    assert client.get(f"/api/watches/{watch_id}/history").status_code == 404
+
+
+def test_api_rejects_unsafe_product_url(client):
+    response = client.post("/api/watches", json={"url": "http://127.0.0.1/private"})
+
+    assert response.status_code == 422
+    assert "public website" in response.json()["detail"]

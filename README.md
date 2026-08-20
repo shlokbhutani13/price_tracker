@@ -21,6 +21,19 @@ Price Tracker is a small FastAPI application for saving product-price snapshots 
 
 It does not attempt to bypass CAPTCHAs, authentication, rate limits, or store anti-bot systems. Support for arbitrary retail sites is best effort because page structure and access policies differ.
 
+## REST API
+
+The web interface and API use the same URL validation, scraping, and SQLite persistence path.
+
+| Method | Route | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/watches` | Add a product from a JSON body such as `{"url": "https://example.com/product"}` |
+| `POST` | `/api/watches/{watch_id}/refresh` | Fetch and store a new price snapshot |
+| `GET` | `/api/watches/{watch_id}/history` | Return the tracked product, price history, latest price, and lowest price |
+| `DELETE` | `/api/watches/{watch_id}` | Delete a tracked product and its price history |
+
+The API returns JSON and uses `422` for rejected or unparseable product URLs and `404` for an unknown watch.
+
 ## Run locally
 
 Use Python 3.12 or newer:

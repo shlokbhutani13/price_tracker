@@ -3,8 +3,9 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import FastAPI, Form, HTTPException, Request, Response, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from pydantic import BaseModel
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
@@ -34,6 +35,23 @@ async def lifespan(_: FastAPI):
 app = FastAPI(title="Price Tracker", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
 templates = Jinja2Templates(directory=BASE_DIR / "templates")
+
+
+class WatchCreate(BaseModel):
+    url: str
+
+
+def watch_response(watch) -> dict:
+    return {
+        "id": watch.id,
+        "url": watch.url,
+        "title": watch.title,
+        "last_price": watch.last_price,
+        "currency": watch.currency,
+        "in_stock": watch.in_stock,
+        "last_checked": watch.last_checked,
+        "last_error": watch.last_error,
+    }
 
 
 def canonicalize_url(url: str) -> str:
@@ -98,6 +116,93 @@ def chart_bars(stats) -> list[dict]:
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+@app.post("/api/watches", status_code=status.HTTP_201_CREATED)
+async def create_watch_api(request: WatchCreate):
+    candidate = canonicalize_url(request.url)
+    try:
+        product = await scrape_product(candidate)
+        watch_id, created = await add_watch(
+            url=product.url,
+            title=product.title,
+            price=product.price,
+            currency=product.currency,
+            in_stock=product.in_stock,
+        )
+    except (ScrapeBlocked, ScrapeFailed) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Unexpected error while adding a product watch through the API")
+        raise HTTPException(
+            status_code=500,
+            detail="The product could not be added right now.",
+        ) from exc
+
+    watch = await get_watch(watch_id)
+    if watch is None:
+        raise HTTPException(status_code=500, detail="The product could not be saved.")
+    payload = {"watch": watch_response(watch), "created": created}
+    if not created:
+        return JSONResponse(payload, status_code=status.HTTP_200_OK)
+    return payload
+
+
+@app.post("/api/watches/{watch_id}/refresh")
+async def refresh_watch_api(watch_id: int):
+    watch = await get_watch(watch_id)
+    if watch is None:
+        raise HTTPException(status_code=404, detail="That watch no longer exists.")
+
+    try:
+        product = await scrape_product(watch.url)
+        await update_watch(
+            watch_id=watch_id,
+            title=product.title,
+            price=product.price,
+            currency=product.currency,
+            in_stock=product.in_stock,
+        )
+    except (ScrapeBlocked, ScrapeFailed) as exc:
+        await mark_check_failed(watch_id, str(exc))
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Unexpected error while refreshing watch %s through the API", watch_id)
+        message = "The product could not be checked right now."
+        await mark_check_failed(watch_id, message)
+        raise HTTPException(status_code=500, detail=message) from exc
+
+    updated_watch = await get_watch(watch_id)
+    if updated_watch is None:
+        raise HTTPException(status_code=500, detail="The product could not be refreshed.")
+    return {"watch": watch_response(updated_watch)}
+
+
+@app.get("/api/watches/{watch_id}/history")
+async def watch_history_api(watch_id: int):
+    watch = await get_watch(watch_id)
+    if watch is None:
+        raise HTTPException(status_code=404, detail="That watch no longer exists.")
+
+    stats = await get_price_stats(watch_id, limit=100)
+    return {
+        "watch": watch_response(watch),
+        "history": [
+            {"price": point.price, "checked_at": point.checked_at}
+            for point in stats.points
+        ],
+        "lowest_price": stats.lowest,
+        "latest_price": stats.latest,
+    }
+
+
+@app.delete("/api/watches/{watch_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_watch_api(watch_id: int):
+    watch = await get_watch(watch_id)
+    if watch is None:
+        raise HTTPException(status_code=404, detail="That watch no longer exists.")
+    await delete_watch(watch_id)
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
 @app.get("/", response_class=HTMLResponse)
