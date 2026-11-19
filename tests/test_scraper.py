@@ -90,7 +90,12 @@ def test_parse_money_handles_symbols_and_commas():
 
 
 @pytest.mark.asyncio
-async def test_scrape_books_to_scrape_product():
+async def test_scrape_books_to_scrape_product(monkeypatch):
+    # Keep the test offline: pretend the shop's hostname resolves to a public address.
+    monkeypatch.setattr(
+        "scraper.socket.getaddrinfo",
+        lambda *args, **kwargs: [(None, None, None, "", ("93.184.216.34", 443))],
+    )
     html = """
     <html>
       <div class="product_main">
