@@ -1,57 +1,52 @@
 # Price Tracker
 
-Price Tracker is a small FastAPI application for saving product-price snapshots from public web pages. It demonstrates the parts of scraping that matter in a backend project: URL validation, bounded HTTP requests, structured metadata parsing, controlled failures, SQLite history, and a server-rendered interface.
+[![CI](https://github.com/shlokbhutani13/price_tracker/actions/workflows/ci.yml/badge.svg)](https://github.com/shlokbhutani13/price_tracker/actions/workflows/ci.yml)
 
-## See it in action
+Paste a product link, save its price, and check back later to see if it dropped. It's a small FastAPI app, and most of the work went into making the scraping safe and reliable.
 
-- [Open the live application](https://price-tracker-3sjc.onrender.com)
-- [Project overview in my portfolio](https://shlokbhutani13.github.io/)
+**Try it:** [live app](https://price-tracker-3sjc.onrender.com) (free hosting, so the first load can take up to a minute)
 
 ## What it does
 
-- accepts public HTTP and HTTPS product URLs
-- blocks local, private, link-local, reserved, and credential-bearing destinations
-- validates every redirect before following it
-- limits responses to HTML pages up to 2 MiB
-- reads Books to Scrape pages reliably
-- prefers JSON-LD and product metadata on other sites
-- stores price snapshots in SQLite
-- shows the lowest observed price and the latest movement
-- keeps the last valid price when a later check fails
+- Saves a price snapshot from a public product page and keeps the history in SQLite.
+- Shows the lowest price seen and the latest change.
+- Keeps the last good price if a later check fails.
+- Reads [Books to Scrape](https://books.toscrape.com) reliably. On other shops it looks for standard product data (JSON-LD and meta tags), so results vary.
 
-It does not attempt to bypass CAPTCHAs, authentication, rate limits, or store anti-bot systems. Support for arbitrary retail sites is best effort because page structure and access policies differ.
+## The safety part
 
-## REST API
+A scraper that fetches any URL a user types can be tricked into hitting internal servers. So it:
 
-The web interface and API use the same URL validation, scraping, and SQLite persistence path.
+- only allows public http/https addresses, and blocks private, local and reserved IPs
+- checks every redirect before following it
+- only reads HTML pages, up to 2 MB
 
-| Method | Route | Purpose |
+It doesn't try to get around CAPTCHAs, logins or anti-bot systems.
+
+## API
+
+The web page and the API share the same code.
+
+| Method | Route | What it does |
 | --- | --- | --- |
-| `POST` | `/api/watches` | Add a product from a JSON body such as `{"url": "https://example.com/product"}` |
-| `POST` | `/api/watches/{watch_id}/refresh` | Fetch and store a new price snapshot |
-| `GET` | `/api/watches/{watch_id}/history` | Return the tracked product, price history, latest price, and lowest price |
-| `DELETE` | `/api/watches/{watch_id}` | Delete a tracked product and its price history |
+| `POST` | `/api/watches` | Track a product. Body: `{"url": "https://..."}` |
+| `POST` | `/api/watches/{id}/refresh` | Check the price again |
+| `GET` | `/api/watches/{id}/history` | Price history, latest and lowest price |
+| `DELETE` | `/api/watches/{id}` | Stop tracking and delete the history |
 
-The API returns JSON and uses `422` for rejected or unparseable product URLs and `404` for an unknown watch.
+Bad or unreadable URLs return `422`. Unknown IDs return `404`.
 
-## Run locally
+## Run it locally
 
-Use Python 3.12 or newer:
+You need Python 3.12 or newer.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app:app --reload
 ```
 
-Open `http://127.0.0.1:8000`. A working sample URL is available in the form.
-
-The database defaults to `tracker.db`. Set `PRICE_TRACKER_DB_PATH` to use another location:
-
-```bash
-PRICE_TRACKER_DB_PATH=/tmp/price-tracker.db uvicorn app:app
-```
+Open `http://127.0.0.1:8000`. The form has a sample link you can try. To store the database somewhere else, set `PRICE_TRACKER_DB_PATH`.
 
 ## Tests
 
@@ -60,28 +55,11 @@ pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-The tests use mocked HTTP transports and temporary SQLite files. They cover unsafe URL rejection, redirects, response limits, metadata extraction, database history, duplicate watches, and route behavior.
+The tests run fully offline with mocked HTTP and temporary databases. They cover unsafe URLs, redirects, size limits, price parsing, history and the API routes.
 
-## Structure
+## Limits
 
-```text
-app.py                 FastAPI routes and presentation helpers
-scraper.py             URL safety, fetching, and product extraction
-db.py                  SQLite records and price-history queries
-templates/index.html   Server-rendered interface
-static/styles.css      Responsive styling
-tests/                  Scraper, database, and route tests
-```
-
-## Deployment notes
-
-The application exposes `GET /health` and starts with:
-
-```bash
-uvicorn app:app --host 0.0.0.0 --port "$PORT"
-```
-
-SQLite is suitable for this single-instance demonstration. A production service with multiple instances would need shared persistent storage and a distributed rate limit.
+SQLite is fine for one small server. Running several copies would need a shared database and rate limiting.
 
 ## License
 
